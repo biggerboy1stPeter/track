@@ -1,0 +1,20 @@
+{
+  "name": "redirector",
+  "version": "1.0.0",
+  "description": "Obfuscated tracking redirector with bot evasion",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "uuid": "^9.0.0",
+    "base-64": "^1.0.0",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^6.7.0",
+    "node-fetch": "^2.6.1"
+  }
+}
