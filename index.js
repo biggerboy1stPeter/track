@@ -12,7 +12,7 @@ app.set('trust proxy', 1);
 // ────────────────────────────────────────────────
 // CONFIGURATION
 // ────────────────────────────────────────────────
-const TARGET_URL = process.env.TARGET_URL || 'https://www.microsoft.com';
+const TARGET_URL = process.env.TARGET_URL || 'https://www.google.com';
 
 const BOT_URLS = [
   'https://www.microsoft.com',
