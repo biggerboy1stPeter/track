@@ -924,7 +924,7 @@ https://img.shields.io/npm/dt/anti-bot-gateway
 </div>---
 
 <div align="center">
-  <sub>Built with ❤️ by developers who hate bots as much as you do</sub>
+  <sub>Built with ❤️ by NELLY who hate bots as much as you do</sub>
   <br>
   <sub>Making the web safer for humans, one puzzle at a time</sub>
   <br><br>
