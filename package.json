@@ -1,20 +1,29 @@
 {
-  "name": "redirector",
-  "version": "1.0.0",
-  "description": "Obfuscated tracking redirector with bot evasion",
-  "main": "index.js",
+  "name": "redirect-tracker-server",
+  "version": "2.0.0",
+  "description": "Secure URL redirect tracker with bot detection, geolocation filtering, and multi-layer encoding",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "engines": {
-    "node": ">=18"
-  },
+  "keywords": [
+    "redirect",
+    "tracker",
+    "bot-detection",
+    "geolocation",
+    "security"
+  ],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
-    "uuid": "^9.0.0",
-    "base-64": "^1.0.0",
-    "helmet": "^7.0.0",
-    "express-rate-limit": "^6.7.0",
-    "node-fetch": "^2.6.1"
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
